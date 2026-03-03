@@ -448,33 +448,8 @@ SNR robustness:
 - 10 dB: 97.72%
 - 20 dB: 98.24%
 
-## Citation
-
-If this project is helpful for your research, please consider citing:
-
-```bibtex
-@article{wgan-ecanet-2025,
-  title={WGAN-ECANet: A Radio Signal Modulation Recognition Method Integrating Multi-scale Attention and Dynamic Gradient Penalty},
-  author={Author Name},
-  journal={IEEE Transactions on Wireless Communications},
-  year={2025}
-}
-```
-
 ## License
 
 This project is open source under the MIT License. See [LICENSE](LICENSE) file for details.
 
-## Contact
 
-- Project homepage: <repository-url>
-- Issue reporting: Through GitHub Issues
-- Email: <email-address>
-
-## Acknowledgments
-
-Thanks to the RadioML dataset providers and contributors to PyTorch and related open source communities.
-
----
-
-**Last Updated**: January 2025
