@@ -3,10 +3,10 @@
 """
 WGAN-GP Trainer
 
-Implements complete Wasserstein GAN with Gradient Penalty training workflow:
+Implements complete Wasserstein GAN with Gradient Penalty training pipeline:
 - Discriminator (Critic) training: maximize W(x_real) - W(x_fake)
 - Generator training: minimize -W(x_fake)
-- Gradient penalty: λ(‖∇_x̂ D(x̂)‖₂ - 1)²
+- Gradient penalty: lambda(||gradient_x_hat D(x_hat)||_2 - 1)^2
 - Dynamic gradient penalty coefficient adjustment
 - Classifier joint training
 """
@@ -24,17 +24,17 @@ import gc
 class WGANTrainer:
     """
     WGAN-GP Trainer
-    
-    Training workflow:
-    1. Train discriminator D (n_critic times)
+
+    Training pipeline:
+    1. Train Discriminator D (n_critic times)
        - Maximize: E[D(x_real)] - E[D(x_fake)]
        - Add gradient penalty
-    2. Train generator G (1 time)
+    2. Train Generator G (1 time)
        - Minimize: -E[D(x_fake)]
-    3. Train classifier C
+    3. Train Classifier C
        - Standard cross-entropy loss
     """
-    
+
     def __init__(
         self,
         model,
@@ -44,7 +44,7 @@ class WGANTrainer:
         lr_c: float = 1e-3,
         beta1: float = 0.9,
         beta2: float = 0.999,
-        weight_decay: float = 3e-4,
+        weight_decay: float = 1e-3,  # Increased L2 regularization from 3e-4 to 1e-3
         lambda_gp: float = 10.0,
         n_critic: int = 5,
         use_dynamic_gp: bool = True,
@@ -64,10 +64,10 @@ class WGANTrainer:
             beta1, beta2: AdamW optimizer parameters (paper: 0.9, 0.999)
             weight_decay: L2 regularization coefficient (paper: 3e-4)
             lambda_gp: Gradient penalty coefficient
-            n_critic: Number of discriminator training steps per generator step
+            n_critic: Train discriminator n_critic times per generator step
             use_dynamic_gp: Whether to use dynamic gradient penalty
-            gp_base: Gradient penalty coefficient initial value
-            gp_min: Gradient penalty coefficient minimum value
+            gp_base: Initial gradient penalty coefficient
+            gp_min: Minimum gradient penalty coefficient
             classifier_weight: Classification loss weight
             gan_weight: GAN loss weight (for classifier)
             gradient_accumulation_steps: Gradient accumulation steps (paper: 2)
@@ -78,31 +78,31 @@ class WGANTrainer:
         self.classifier_weight = classifier_weight
         self.gan_weight = gan_weight
         self.gradient_accumulation_steps = gradient_accumulation_steps
-        
+
         self.lambda_gp = lambda_gp
         self.use_dynamic_gp = use_dynamic_gp
         self.gp_base = gp_base
         self.gp_min = gp_min
         self.current_lambda = gp_base
-        
+
         self.total_steps = 0
         self.current_step = 0
-        
+
         self.optimizer_G = optim.AdamW(
             model.generator.parameters(),
-            lr=lr_g, betas=(beta1, beta2), eps=1e-8, weight_decay=weight_decay
+            lr=lr_g, betas=(0.0, beta2), eps=1e-8, weight_decay=weight_decay  # WGAN-GP: beta1=0
         )
         self.optimizer_D = optim.AdamW(
             model.discriminator.parameters(),
-            lr=lr_d, betas=(beta1, beta2), eps=1e-8, weight_decay=weight_decay
+            lr=lr_d, betas=(0.0, beta2), eps=1e-8, weight_decay=weight_decay  # WGAN-GP: beta1=0
         )
         self.optimizer_C = optim.AdamW(
             model.classifier.parameters(),
             lr=lr_c, betas=(beta1, beta2), eps=1e-8, weight_decay=weight_decay
         )
-        
+
         # Use ReduceLROnPlateau learning rate scheduler (paper setting)
-        # Monitor validation accuracy, multiply learning rate by 0.5 after 5 consecutive epochs without improvement
+        # Monitor validation accuracy, multiply learning rate by 0.5 if no improvement for 5 epochs
         self.schedulers = {
             'G': optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer_G, mode='max', factor=0.5, patience=5
@@ -114,25 +114,26 @@ class WGANTrainer:
                 self.optimizer_C, mode='max', factor=0.5, patience=5
             )
         }
-        
-        self.criterion_classifier = nn.CrossEntropyLoss()
-        
+
+        # Use Label Smoothing for additional regularization
+        self.criterion_classifier = nn.CrossEntropyLoss(label_smoothing=0.1)
+
     def set_total_steps(self, total_steps: int):
         """Set total training steps for dynamic gradient penalty"""
         self.total_steps = total_steps
         self.model.gradient_penalty.set_total_steps(total_steps)
-        
+
     def _update_lambda_gp(self):
         """Dynamically update gradient penalty coefficient"""
         if not self.use_dynamic_gp:
             return
-            
+
         t = self.current_step
         T = self.total_steps
-        
+
         if T == 0:
             return
-            
+
         if t < 0.3 * T:
             self.current_lambda = self.gp_base
         elif t < 0.7 * T:
@@ -140,29 +141,29 @@ class WGANTrainer:
             self.current_lambda = self.gp_base - (self.gp_base - self.gp_min) * progress
         else:
             self.current_lambda = self.gp_min
-            
+
         self.model.gradient_penalty.current_lambda = self.current_lambda
-        
+
     def compute_gradient_penalty(
-        self, 
-        real_samples: torch.Tensor, 
+        self,
+        real_samples: torch.Tensor,
         fake_samples: torch.Tensor
     ) -> torch.Tensor:
         """
         Compute gradient penalty
-        
-        GP = λ(‖∇_x̂ D(x̂)‖₂ - 1)²
-        
-        where x̂ = εx_real + (1-ε)x_fake
+
+        GP = lambda(||gradient_x_hat D(x_hat)||_2 - 1)^2
+
+        where x_hat = epsilon * x_real + (1-epsilon) * x_fake
         """
         batch_size = real_samples.size(0)
-        
+
         alpha = torch.rand(batch_size, 1, 1, device=self.device)
         interpolates = alpha * real_samples + (1 - alpha) * fake_samples
         interpolates.requires_grad_(True)
-        
+
         d_interpolates = self.model.discriminator(interpolates)
-        
+
         gradients = torch.autograd.grad(
             outputs=d_interpolates,
             inputs=interpolates,
@@ -171,14 +172,14 @@ class WGANTrainer:
             retain_graph=True,
             only_inputs=True
         )[0]
-        
+
         gradients = gradients.view(batch_size, -1)
         gradient_norm = gradients.norm(2, dim=1)
-        
+
         gradient_penalty = ((gradient_norm - 1) ** 2).mean()
-        
+
         return gradient_penalty
-    
+
     def train_discriminator(
         self,
         real_samples: torch.Tensor,
@@ -189,20 +190,20 @@ class WGANTrainer:
         Train discriminator
 
         Loss function:
-        L_D = -E[D(x_real)] + E[D(x_fake)] + λ * GP
+        L_D = -E[D(x_real)] + E[D(x_fake)] + lambda * GP
         """
-        # Only zero gradients at first step
+        # Zero gradients only on first step
         if accumulation_step == 0:
             self.optimizer_D.zero_grad()
 
-        d_real = self.model.discriminator(real_samples)
+        d_real = self.model.discriminator(real_samples, labels)  # Conditional discrimination
         loss_d_real = -d_real.mean()
 
         batch_size = real_samples.size(0)
         noise = torch.randn(batch_size, self.model.generator.noise_dim, device=self.device)
         fake_samples = self.model.generator(noise, labels)
 
-        d_fake = self.model.discriminator(fake_samples.detach())
+        d_fake = self.model.discriminator(fake_samples.detach(), labels)  # Conditional discrimination
         loss_d_fake = d_fake.mean()
 
         gradient_penalty = self.compute_gradient_penalty(real_samples, fake_samples.detach())
@@ -213,7 +214,7 @@ class WGANTrainer:
         loss_D = loss_D / self.gradient_accumulation_steps
         loss_D.backward()
 
-        # Only update parameters at last step
+        # Update parameters only on last step
         if accumulation_step == self.gradient_accumulation_steps - 1:
             torch.nn.utils.clip_grad_norm_(self.model.discriminator.parameters(), max_norm=1.0)
             self.optimizer_D.step()
@@ -225,7 +226,7 @@ class WGANTrainer:
             'gradient_penalty': gradient_penalty.item(),
             'wasserstein_distance': (-loss_d_real - loss_d_fake).item()
         }
-    
+
     def train_generator(
         self,
         labels: torch.Tensor,
@@ -237,7 +238,7 @@ class WGANTrainer:
         Loss function:
         L_G = -E[D(x_fake)]
         """
-        # Only zero gradients at first step
+        # Zero gradients only on first step
         if accumulation_step == 0:
             self.optimizer_G.zero_grad()
 
@@ -252,7 +253,7 @@ class WGANTrainer:
         loss_G = loss_G / self.gradient_accumulation_steps
         loss_G.backward()
 
-        # Only update parameters at last step
+        # Update parameters only on last step
         if accumulation_step == self.gradient_accumulation_steps - 1:
             torch.nn.utils.clip_grad_norm_(self.model.generator.parameters(), max_norm=1.0)
             self.optimizer_G.step()
@@ -260,26 +261,32 @@ class WGANTrainer:
         return {
             'loss_G': loss_G.item() * self.gradient_accumulation_steps
         }
-    
+
     def train_classifier(
         self,
         real_samples: torch.Tensor,
         labels: torch.Tensor,
-        use_gan_loss: bool = True,
+        use_gan_loss: bool = False,  # Disable GAN loss by default to avoid misleading classifier
         accumulation_step: int = 0
     ) -> Dict[str, float]:
         """
         Train classifier
 
         Loss function:
-        L_C = L_classification + α * L_GAN
+        L_C = L_classification (+ alpha * L_GAN, optional but disabled by default)
+
+        Note: GAN loss trains classifier with low-quality generated samples, which may mislead learning
+        Only enable when generator is well-trained
         """
-        # Only zero gradients at first step
+        # Zero gradients only on first step
         if accumulation_step == 0:
             self.optimizer_C.zero_grad()
 
         outputs = self.model.classifier(real_samples)
         loss_classification = self.criterion_classifier(outputs, labels)
+
+        # Disable GAN loss by default to avoid early low-quality generated samples misleading classifier
+        loss_gan = torch.tensor(0.0)
 
         if use_gan_loss and self.gan_weight > 0:
             with torch.no_grad():
@@ -289,17 +296,15 @@ class WGANTrainer:
 
             fake_outputs = self.model.classifier(fake_samples.detach())
             loss_gan = self.criterion_classifier(fake_outputs, labels)
-
             loss_C = self.classifier_weight * loss_classification + self.gan_weight * loss_gan
         else:
             loss_C = loss_classification
-            loss_gan = torch.tensor(0.0)
 
         # Gradient accumulation: divide by accumulation steps
         loss_C = loss_C / self.gradient_accumulation_steps
         loss_C.backward()
 
-        # Only update parameters at last step
+        # Update parameters only on last step
         if accumulation_step == self.gradient_accumulation_steps - 1:
             torch.nn.utils.clip_grad_norm_(self.model.classifier.parameters(), max_norm=1.0)
             self.optimizer_C.step()
@@ -313,7 +318,7 @@ class WGANTrainer:
             'loss_gan': loss_gan.item() if isinstance(loss_gan, torch.Tensor) else 0.0,
             'accuracy': accuracy
         }
-    
+
     def train_step(
         self,
         real_samples: torch.Tensor,
@@ -349,13 +354,13 @@ class WGANTrainer:
             c_metrics = self.train_classifier(real_samples, labels, accumulation_step=accumulation_step)
             metrics.update(c_metrics)
 
-        # Only update global step at last step
+        # Update global step only on last step
         if accumulation_step == self.gradient_accumulation_steps - 1:
             self.current_step += 1
             self._update_lambda_gp()
 
         return metrics
-    
+
     def train_epoch(
         self,
         train_loader: DataLoader,
@@ -365,7 +370,11 @@ class WGANTrainer:
         train_classifier: bool = True
     ) -> Dict[str, float]:
         """
-        Train one epoch (supports gradient accumulation)
+        Train one epoch (corrected: use each batch only once)
+
+        WGAN-GP training pipeline:
+        - Each batch: train D n_critic times (using same batch), then train G 1 time, finally train C
+        - This way each batch is used only once, avoiding data waste
 
         Args:
             train_loader: Training data loader
@@ -384,56 +393,73 @@ class WGANTrainer:
             'wasserstein_distance': 0.0,
             'gradient_penalty': 0.0
         }
-        num_batches = 0
+        num_d_updates = 0
+        num_g_updates = 0
+
+        # Initialize metrics (avoid undefined in conditional branches)
+        d_metrics = {'loss_D': 0, 'wasserstein_distance': 0, 'gradient_penalty': 0}
+        g_metrics = {'loss_G': 0}
+        c_metrics = {'loss_C': 0, 'accuracy': 0}
 
         pbar = tqdm(train_loader, desc=f'Epoch {epoch+1} [Train]')
-        for batch_idx, batch_data in enumerate(pbar):
-            real_samples = batch_data['signals'].to(self.device)
-            labels = batch_data['labels'].to(self.device)
 
-            # Calculate current gradient accumulation step
-            accumulation_step = batch_idx % self.gradient_accumulation_steps
+        for batch_idx, batch in enumerate(pbar):
+            real_samples = batch['signals'].to(self.device)
+            labels = batch['labels'].to(self.device)
 
-            metrics = self.train_step(
-                real_samples, labels,
-                train_discriminator=train_discriminator,
-                train_generator=train_generator,
-                train_classifier=train_classifier,
-                accumulation_step=accumulation_step
-            )
+            # WGAN-GP: train D n_critic times (using same batch)
+            if train_discriminator:
+                for _ in range(self.n_critic):
+                    d_metrics = self.train_discriminator(real_samples, labels)
+                    num_d_updates += 1
 
-            for key in epoch_metrics:
-                if key in metrics:
-                    epoch_metrics[key] += metrics[key]
-            num_batches += 1
+                # Record D metrics (only last one)
+                epoch_metrics['loss_D'] += d_metrics['loss_D']
+                epoch_metrics['wasserstein_distance'] += d_metrics['wasserstein_distance']
+                epoch_metrics['gradient_penalty'] += d_metrics['gradient_penalty']
+
+            # Train G
+            if train_generator:
+                g_metrics = self.train_generator(labels)
+                num_g_updates += 1
+                epoch_metrics['loss_G'] += g_metrics['loss_G']
+
+            # Train classifier (using same batch, correct gradient accumulation implementation)
+            if train_classifier:
+                accumulation_step = batch_idx % self.gradient_accumulation_steps
+                c_metrics = self.train_classifier(real_samples, labels, accumulation_step=accumulation_step)
+                epoch_metrics['loss_C'] += c_metrics['loss_C']
+                epoch_metrics['accuracy'] += c_metrics['accuracy']
+
+            # Update step and lambda_gp
+            self.current_step += 1
+            self._update_lambda_gp()
 
             pbar.set_postfix({
-                'loss_D': f'{metrics.get("loss_D", 0):.4f}',
-                'loss_G': f'{metrics.get("loss_G", 0):.4f}',
-                'loss_C': f'{metrics.get("loss_C", 0):.4f}',
-                'acc': f'{metrics.get("accuracy", 0)*100:.2f}%',
-                'λ_gp': f'{self.current_lambda:.1f}',
-                'accum': f'{accumulation_step+1}/{self.gradient_accumulation_steps}'
+                'loss_D': f'{d_metrics.get("loss_D", 0):.4f}',
+                'loss_G': f'{g_metrics.get("loss_G", 0):.4f}',
+                'loss_C': f'{c_metrics.get("loss_C", 0):.4f}',
+                'acc': f'{c_metrics.get("accuracy", 0)*100:.2f}%',
+                'lambda_gp': f'{self.current_lambda:.1f}'
             })
-        
+
+        # Calculate average metrics
+        num_batches = max(1, batch_idx + 1)
         for key in epoch_metrics:
             epoch_metrics[key] /= num_batches
-        
-        # Note: ReduceLROnPlateau needs to be called after validation with validation metric
-        # Not called here, will be called externally after validation
-        
+
         return epoch_metrics
-    
+
     def step_schedulers(self, metric: float):
         """
         Update learning rate schedulers
-        
+
         Args:
             metric: Validation metric (e.g., validation accuracy)
         """
         for scheduler in self.schedulers.values():
             scheduler.step(metric)
-    
+
     def validate(
         self,
         val_loader: DataLoader,
@@ -441,35 +467,35 @@ class WGANTrainer:
     ) -> Dict[str, float]:
         """Validate classifier performance"""
         self.model.eval()
-        
+
         total_loss = 0.0
         correct = 0
         total = 0
-        
+
         with torch.no_grad():
             pbar = tqdm(val_loader, desc=f'Epoch {epoch+1} [Val]  ')
             for batch_data in pbar:
                 signals = batch_data['signals'].to(self.device)
                 labels = batch_data['labels'].to(self.device)
-                
+
                 outputs = self.model.classifier(signals)
                 loss = self.criterion_classifier(outputs, labels)
-                
+
                 total_loss += loss.item()
                 _, predicted = torch.max(outputs.data, 1)
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
-                
+
                 pbar.set_postfix({
                     'loss': f'{loss.item():.4f}',
                     'acc': f'{100*correct/total:.2f}%'
                 })
-        
+
         return {
             'val_loss': total_loss / len(val_loader),
             'val_accuracy': 100 * correct / total
         }
-    
+
     def generate_samples(
         self,
         num_samples: int,
@@ -477,23 +503,23 @@ class WGANTrainer:
     ) -> torch.Tensor:
         """
         Generate samples
-        
+
         Args:
             num_samples: Number of samples to generate
             labels: Specified class labels (optional)
         """
         self.model.eval()
-        
+
         with torch.no_grad():
             noise = torch.randn(num_samples, self.model.generator.noise_dim, device=self.device)
-            
+
             if labels is None:
                 labels = torch.randint(0, 24, (num_samples,), device=self.device)
-            
+
             fake_samples = self.model.generator(noise, labels)
-        
+
         return fake_samples, labels
-    
+
     def save_checkpoint(self, path: str, epoch: int, metrics: Dict):
         """Save checkpoint"""
         torch.save({
@@ -508,19 +534,19 @@ class WGANTrainer:
             'current_lambda': self.current_lambda,
             'current_step': self.current_step
         }, path)
-        
+
     def load_checkpoint(self, path: str):
         """Load checkpoint"""
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        
+
         self.model.generator.load_state_dict(checkpoint['generator_state_dict'])
         self.model.discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
         self.model.classifier.load_state_dict(checkpoint['classifier_state_dict'])
         self.optimizer_G.load_state_dict(checkpoint['optimizer_G_state_dict'])
         self.optimizer_D.load_state_dict(checkpoint['optimizer_D_state_dict'])
         self.optimizer_C.load_state_dict(checkpoint['optimizer_C_state_dict'])
-        
+
         self.current_lambda = checkpoint.get('current_lambda', self.gp_base)
         self.current_step = checkpoint.get('current_step', 0)
-        
+
         return checkpoint['epoch'], checkpoint.get('metrics', {})
