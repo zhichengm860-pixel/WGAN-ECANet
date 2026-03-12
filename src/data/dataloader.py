@@ -2,9 +2,9 @@
 RadioML Data Loader
 
 Provides three data loading methods:
-1. RadioMLDataLoader - Loads all data at once (for small datasets)
-2. StreamingDataLoader - Streams data from HDF5 (for large datasets, memory efficient)
-3. create_dataloaders - Convenient function to create train/val/test loaders
+1. RadioMLDataLoader - One-time loading (suitable for small datasets)
+2. StreamingDataLoader - Streaming loading (suitable for large datasets, memory efficient)
+3. create_dataloaders - Convenience function to automatically create train/val/test loaders
 """
 
 import h5py
@@ -18,27 +18,35 @@ import random
 
 
 # ============================================================================
-# Data Augmentation
+# Data Augmentation Functions
 # ============================================================================
 
 class SignalAugmentation:
     """
-    Signal data augmentation (consistent with paper)
-    - Gaussian white noise (noise_factor=0.02)
-    - Phase shift (50% probability, -10° to 10°)
+    Signal Data Augmentation (Enhanced - Prevent Overfitting)
+    - Gaussian white noise (noise_factor=0.08)
+    - Phase shift (80% probability, -30° to 30°)
+    - Amplitude scaling (random scale 0.7-1.3)
+    - Time shift (random shift up to 50 samples)
     """
 
-    def __init__(self, noise_factor: float = 0.02, phase_shift_prob: float = 0.5,
-                 phase_shift_range: Tuple[float, float] = (-10, 10)):
+    def __init__(self, noise_factor: float = 0.08, phase_shift_prob: float = 0.8,
+                 phase_shift_range: Tuple[float, float] = (-30, 30),
+                 amplitude_scale_range: Tuple[float, float] = (0.7, 1.3),
+                 time_shift_max: int = 50):
         """
         Args:
-            noise_factor: Gaussian noise factor (paper: 0.02)
-            phase_shift_prob: Phase shift probability (paper: 0.5)
-            phase_shift_range: Phase shift range in degrees (paper: -10° to 10°)
+            noise_factor: Gaussian noise factor (enhanced: 0.08)
+            phase_shift_prob: Phase shift probability (enhanced: 0.8)
+            phase_shift_range: Phase shift range in degrees (enhanced: -30° to 30°)
+            amplitude_scale_range: Amplitude scaling range (new: 0.7-1.3)
+            time_shift_max: Maximum time shift samples (new: 50)
         """
         self.noise_factor = noise_factor
         self.phase_shift_prob = phase_shift_prob
         self.phase_shift_range = phase_shift_range
+        self.amplitude_scale_range = amplitude_scale_range
+        self.time_shift_max = time_shift_max
 
     def add_gaussian_noise(self, signal: torch.Tensor) -> torch.Tensor:
         """Add Gaussian white noise"""
@@ -73,12 +81,25 @@ class SignalAugmentation:
 
         return signal
 
+    def amplitude_scale(self, signal: torch.Tensor) -> torch.Tensor:
+        """Amplitude scaling augmentation"""
+        scale = random.uniform(self.amplitude_scale_range[0], self.amplitude_scale_range[1])
+        return signal * scale
+
+    def time_shift(self, signal: torch.Tensor) -> torch.Tensor:
+        """Time shift augmentation"""
+        shift = random.randint(-self.time_shift_max, self.time_shift_max)
+        if shift == 0:
+            return signal
+        # Circular shift
+        return torch.roll(signal, shifts=shift, dims=1)
+
     def __call__(self, signal: torch.Tensor) -> torch.Tensor:
         """
         Apply data augmentation
 
         Args:
-            signal: Signal tensor with shape (2, 1024)
+            signal: Signal tensor, shape (2, 1024)
         Returns:
             Augmented signal
         """
@@ -88,11 +109,17 @@ class SignalAugmentation:
         # Phase shift
         signal = self.phase_shift(signal)
 
+        # Amplitude scaling
+        signal = self.amplitude_scale(signal)
+
+        # Time shift
+        signal = self.time_shift(signal)
+
         return signal
 
 
 # ============================================================================
-# Modulation Classes
+# Modulation Type Definitions
 # ============================================================================
 
 MODULATION_CLASSES = [
@@ -110,48 +137,64 @@ MODULATION_CLASSES = [
 class RadioMLDataset(Dataset):
     """
     RadioML Dataset Class
-    
+
     Supports:
-    - Creation from in-memory numpy arrays
+    - Creating from numpy arrays in memory
     - Automatic shape conversion (1024, 2) -> (2, 1024)
-    - One-hot label conversion to class indices
+    - One-hot label to class index conversion
+    - Automatic normalization to [-1, 1] range (matching Tanh output)
     """
-    
-    def __init__(self, signals: np.ndarray, labels: np.ndarray, transform=None):
+
+    def __init__(self, signals: np.ndarray, labels: np.ndarray, transform=None, normalize: bool = True):
         """
         Args:
-            signals: Signal array with shape (N, 1024, 2) or (N, 2, 1024)
-            labels: Label array with shape (N,) or (N, num_classes) one-hot
+            signals: Signal array, shape (N, 1024, 2) or (N, 2, 1024)
+            labels: Label array, shape (N,) or (N, num_classes) one-hot
             transform: Optional data augmentation function
+            normalize: Whether to normalize to [-1, 1] range
         """
         # Ensure shape is (N, 2, 1024)
         if signals.shape[-1] == 2 and len(signals.shape) == 3:
             signals = signals.transpose(0, 2, 1)
-        
+
+        signals = signals.astype(np.float32)
+
+        # Normalize to [-1, 1] range (matching Generator Tanh output)
+        self.normalize = normalize
+        if normalize:
+            # Calculate global statistics
+            self.mean = signals.mean()
+            self.std = signals.std()
+            # Normalize to [0, 1], then map to [-1, 1]
+            signals_normalized = (signals - self.mean) / (self.std + 1e-8)
+            # Use tanh approximation to map to [-1, 1]
+            signals = np.tanh(signals_normalized)
+            print(f"Data normalization: mean={self.mean:.4f}, std={self.std:.4f}")
+
         self.signals = torch.FloatTensor(signals)
-        
+
         # Convert labels
         if labels.ndim == 2:
             self.labels = torch.LongTensor(np.argmax(labels, axis=1))
         else:
             self.labels = torch.LongTensor(labels)
-        
+
         self.transform = transform
-    
+
     def __len__(self):
         return len(self.signals)
-    
+
     def __getitem__(self, idx):
         signal = self.signals[idx]
         label = self.labels[idx]
-        
+
         # Ensure correct shape
         if signal.dim() == 2 and signal.shape[1] == 2:
             signal = signal.transpose(0, 1)
-        
+
         if self.transform:
             signal = self.transform(signal)
-        
+
         return {
             'signals': signal,
             'labels': label,
@@ -161,9 +204,9 @@ class RadioMLDataset(Dataset):
 
 class StreamingRadioMLDataset(Dataset):
     """
-    Streaming Dataset Class - Reads directly from HDF5 file on demand, saves memory
+    Streaming Dataset Class - Read from HDF5 file on demand, memory efficient
 
-    Use case: Large datasets (e.g., RadioML 2018.01A with 2.55M samples)
+    Use case: Large datasets (e.g., RadioML 2018.01A, 2.55M samples)
     """
 
     def __init__(self, hdf5_path: str, indices: np.ndarray, include_snr: bool = True, transform=None):
@@ -218,7 +261,7 @@ class StreamingRadioMLDataset(Dataset):
             result['snr'] = torch.tensor(snr, dtype=torch.float32)
 
         return result
-    
+
     def __del__(self):
         if self._file is not None:
             self._file.close()
@@ -230,15 +273,15 @@ class StreamingRadioMLDataset(Dataset):
 
 class RadioMLDataLoader:
     """
-    RadioML Data Loader - Loads all data into memory at once
-    
-    Use case: Small datasets or when memory is abundant
-    
+    RadioML Data Loader - Load all data into memory at once
+
+    Use case: Small datasets or when memory is sufficient
+
     Usage:
         loader = RadioMLDataLoader('dataset.hdf5')
         train_ds, val_ds, test_ds = loader.get_stratified_split()
     """
-    
+
     def __init__(self, hdf5_path: str, max_samples: Optional[int] = None):
         """
         Args:
@@ -248,11 +291,11 @@ class RadioMLDataLoader:
         self.hdf5_path = hdf5_path
         self.max_samples = max_samples
         self._load_data()
-    
+
     def _load_data(self):
         """Load data into memory"""
         print(f"Loading data: {self.hdf5_path}")
-        
+
         with h5py.File(self.hdf5_path, 'r') as f:
             if self.max_samples is not None:
                 total_samples = f['X'].shape[0]
@@ -263,23 +306,23 @@ class RadioMLDataLoader:
             else:
                 self.X = f['X'][:]
                 self.Y = f['Y'][:]
-        
+
         print(f"Data shape: {self.X.shape}")
         print(f"Label shape: {self.Y.shape}")
-    
+
     def get_stratified_split(self, train_ratio: float = 0.8, val_ratio: float = 0.1,
                              test_ratio: float = 0.1, random_state: int = 42
                              ) -> Tuple[RadioMLDataset, RadioMLDataset, RadioMLDataset]:
-        """Stratified dataset split"""
+        """Stratified split of dataset"""
         labels = np.argmax(self.Y, axis=1) if self.Y.ndim == 2 else self.Y
-        
+
         X_train, X_temp, Y_train, Y_temp = train_test_split(
-            self.X, self.Y, 
+            self.X, self.Y,
             test_size=(val_ratio + test_ratio),
             random_state=random_state,
             stratify=labels
         )
-        
+
         val_test_ratio = test_ratio / (val_ratio + test_ratio)
         labels_temp = np.argmax(Y_temp, axis=1) if Y_temp.ndim == 2 else Y_temp
         X_val, X_test, Y_val, Y_test = train_test_split(
@@ -288,13 +331,13 @@ class RadioMLDataLoader:
             random_state=random_state,
             stratify=labels_temp
         )
-        
+
         train_dataset = RadioMLDataset(X_train, Y_train)
         val_dataset = RadioMLDataset(X_val, Y_val)
         test_dataset = RadioMLDataset(X_test, Y_test)
-        
+
         print(f"\nStratified split: train={len(train_dataset)}, val={len(val_dataset)}, test={len(test_dataset)}")
-        
+
         return train_dataset, val_dataset, test_dataset
 
 
@@ -319,10 +362,10 @@ def create_dataloaders(hdf5_path: str, batch_size: int = 256,
         val_ratio: Validation set ratio
         test_ratio: Test set ratio
         random_state: Random seed
-        num_workers: Number of data loading threads
+        num_workers: Number of data loading workers
         use_streaming: Whether to use streaming loading (recommended for large datasets)
         include_snr: Whether to include SNR information
-        use_augmentation: Whether to use data augmentation (train set only)
+        use_augmentation: Whether to use data augmentation (training set only)
 
     Returns:
         train_loader, val_loader, test_loader
@@ -333,35 +376,35 @@ def create_dataloaders(hdf5_path: str, batch_size: int = 256,
         )
     """
     print(f"Creating data loaders (streaming={use_streaming}, include_snr={include_snr})...")
-    
+
     # Get dataset info
     with h5py.File(hdf5_path, 'r') as f:
         total_samples = f['X'].shape[0]
         num_classes = f['Y'].shape[1] if f['Y'].ndim > 1 else len(MODULATION_CLASSES)
-    
+
     print(f"  Total samples: {total_samples:,}")
     print(f"  Num classes: {num_classes}")
-    
+
     # Read labels in chunks for stratified sampling
     print("Reading labels for stratified split...")
     chunk_size = 500000
     all_indices = []
     all_labels = []
-    
+
     with h5py.File(hdf5_path, 'r') as f:
         for start in range(0, total_samples, chunk_size):
             end = min(start + chunk_size, total_samples)
             labels_chunk = f['Y'][start:end]
             labels_1d = np.argmax(labels_chunk, axis=1) if labels_chunk.ndim == 2 else labels_chunk
-            
+
             all_indices.extend(range(start, end))
             all_labels.extend(labels_1d)
-            
+
             print(f"  Progress: {end:,}/{total_samples:,} ({end/total_samples*100:.1f}%)")
-    
+
     all_indices = np.array(all_indices)
     all_labels = np.array(all_labels)
-    
+
     # Stratified split
     print("Performing stratified split...")
     train_indices, temp_indices, _, temp_labels = train_test_split(
@@ -370,7 +413,7 @@ def create_dataloaders(hdf5_path: str, batch_size: int = 256,
         random_state=random_state,
         stratify=all_labels
     )
-    
+
     val_test_ratio = test_ratio / (val_ratio + test_ratio)
     val_indices, test_indices = train_test_split(
         temp_indices,
@@ -378,17 +421,17 @@ def create_dataloaders(hdf5_path: str, batch_size: int = 256,
         random_state=random_state,
         stratify=temp_labels
     )
-    
-    # Free memory
+
+    # Release label memory
     del all_labels, temp_labels
     gc.collect()
-    
+
     print(f"\nSplit complete:")
     print(f"  Train: {len(train_indices):,} ({len(train_indices)/total_samples*100:.1f}%)")
     print(f"  Val:   {len(val_indices):,} ({len(val_indices)/total_samples*100:.1f}%)")
     print(f"  Test:  {len(test_indices):,} ({len(test_indices)/total_samples*100:.1f}%)")
-    
-    # Create data augmentation (train set only)
+
+    # Create data augmenter (training set only)
     train_transform = SignalAugmentation() if use_augmentation else None
 
     # Create datasets
@@ -397,7 +440,7 @@ def create_dataloaders(hdf5_path: str, batch_size: int = 256,
         val_dataset = StreamingRadioMLDataset(hdf5_path, val_indices, include_snr, None)
         test_dataset = StreamingRadioMLDataset(hdf5_path, test_indices, include_snr, None)
     else:
-        # Load all at once
+        # One-time loading
         with h5py.File(hdf5_path, 'r') as f:
             train_X = f['X'][train_indices]
             train_Y = f['Y'][train_indices]
@@ -409,22 +452,24 @@ def create_dataloaders(hdf5_path: str, batch_size: int = 256,
         train_dataset = RadioMLDataset(train_X, train_Y, train_transform)
         val_dataset = RadioMLDataset(val_X, val_Y, None)
         test_dataset = RadioMLDataset(test_X, test_Y, None)
-    
-    # Create data loaders
+
+    # Create data loaders (disable persistent_workers to avoid memory usage)
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, pin_memory=True,
-        persistent_workers=num_workers > 0
+        persistent_workers=False
     )
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True
+        num_workers=num_workers, pin_memory=True,
+        persistent_workers=False
     )
     test_loader = DataLoader(
         test_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True
+        num_workers=num_workers, pin_memory=True,
+        persistent_workers=False
     )
-    
+
     return train_loader, val_loader, test_loader
 
 
@@ -437,6 +482,5 @@ __all__ = [
     'RadioMLDataset',
     'StreamingRadioMLDataset',
     'RadioMLDataLoader',
-    'create_dataloaders',
-    'SignalAugmentation'
+    'create_dataloaders'
 ]
