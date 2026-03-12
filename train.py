@@ -110,7 +110,8 @@ def main():
     print(f"\nDataset path: {hdf5_path}")
 
     print("\nInitializing data loaders...")
-    num_workers = min(8, num_gpus * 4) if num_gpus > 0 else 4
+    # Use conservative worker count to avoid deadlock
+    num_workers = 2  # Reduced worker count to avoid too many HDF5 file handles
     train_loader, val_loader, test_loader = create_dataloaders(
         hdf5_path=str(hdf5_path),
         batch_size=config['batch_size'],
@@ -127,7 +128,9 @@ def main():
         num_classes=config['num_classes'],
         use_spectral_norm=True,
         use_eca=True,
-        use_multi_scale=True
+        use_multi_scale=True,
+        dropout_rate=0.5,  # Increased dropout to prevent overfitting
+        hidden_scale=0.5   # Use smaller model (half channels)
     )
     model.to(device)
 
@@ -167,7 +170,8 @@ def main():
         lr_c=config['lr_c'],
         lambda_gp=config['lambda_gp'],
         n_critic=config['n_critic'],
-        use_dynamic_gp=config['use_dynamic_gp']
+        use_dynamic_gp=config['use_dynamic_gp'],
+        gan_weight=0.0  # Disable GAN loss interference with classifier to avoid misleading from low-quality generated samples
     )
 
     total_steps = len(train_loader) * config['num_epochs']
@@ -218,6 +222,11 @@ def main():
         print(f"  Dynamic gradient penalty: {config['use_dynamic_gp']}")
     print("-" * 70)
 
+    # Early stopping mechanism
+    patience = 10  # Stop if no improvement for 10 epochs
+    patience_counter = 0
+    early_stop_threshold = 0.001  # Minimum improvement threshold
+
     for epoch in range(start_epoch, config['num_epochs']):
         train_metrics = trainer.train_epoch(
             train_loader, epoch,
@@ -248,12 +257,19 @@ def main():
         print(f'  Train Acc: {train_metrics["accuracy"]*100:.2f}%')
         print(f'  Val Acc: {val_metrics["val_accuracy"]:.2f}%')
 
-        if val_metrics['val_accuracy'] > best_val_acc:
+        if val_metrics['val_accuracy'] > best_val_acc + early_stop_threshold:
             best_val_acc = val_metrics['val_accuracy']
 
             save_path = save_dir / 'best_model.pth'
             trainer.save_checkpoint(str(save_path), epoch, val_metrics)
             print(f'  Saving best model (Val Acc: {val_metrics["val_accuracy"]:.2f}%)')
+            patience_counter = 0  # Reset early stopping counter
+        else:
+            patience_counter += 1
+            print(f'  Early stop counter: {patience_counter}/{patience}')
+            if patience_counter >= patience:
+                print(f'\nEarly stopping triggered! No improvement for {patience} consecutive epochs')
+                break
 
         if (epoch + 1) % 10 == 0:
             checkpoint_path = save_dir / f'checkpoint_epoch_{epoch+1}.pth'
