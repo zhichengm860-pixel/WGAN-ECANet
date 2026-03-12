@@ -215,7 +215,10 @@ class Generator(nn.Module):
 
 
 class Discriminator(nn.Module):
-    """WGAN Discriminator with spectral normalization and ECA attention"""
+    """WGAN Discriminator with spectral normalization, ECA attention, and class conditioning
+    
+    AC-GAN style: Discriminator outputs both real/fake prediction and class prediction
+    """
     
     def __init__(self, signal_length: int = 1024, num_classes: int = 24, channels: int = 2,
                  use_eca: bool = True, use_spectral_norm: bool = True, use_multi_scale: bool = True):
@@ -229,40 +232,87 @@ class Discriminator(nn.Module):
         def maybe_sn(module):
             return spectral_norm(module) if self.use_spectral_norm else module
 
+        # Class embedding for conditional discrimination
+        self.class_embedding = nn.Embedding(num_classes, 64)
+        
         self.multi_scale = MultiScaleFeatureExtractor(channels, 64, use_multi_scale)
         
         layers = []
         
         layers.append(maybe_sn(nn.Conv1d(64, 128, kernel_size=5, stride=2, padding=2)))
-        layers.append(nn.BatchNorm1d(128))
+        layers.append(nn.InstanceNorm1d(128, affine=True))  # WGAN-GP: InstanceNorm instead of BatchNorm
         layers.append(nn.LeakyReLU(0.2, inplace=True))
         if use_eca:
             layers.append(ECANet(128))
 
         layers.append(maybe_sn(nn.Conv1d(128, 256, kernel_size=3, stride=2, padding=1)))
-        layers.append(nn.BatchNorm1d(256))
+        layers.append(nn.InstanceNorm1d(256, affine=True))  # WGAN-GP: InstanceNorm instead of BatchNorm
         layers.append(nn.LeakyReLU(0.2, inplace=True))
         if use_eca:
             layers.append(ECANet(256))
 
         layers.append(maybe_sn(nn.Conv1d(256, 512, kernel_size=3, stride=2, padding=1)))
-        layers.append(nn.BatchNorm1d(512))
+        layers.append(nn.InstanceNorm1d(512, affine=True))  # WGAN-GP: InstanceNorm instead of BatchNorm
         layers.append(nn.LeakyReLU(0.2, inplace=True))
         layers.append(nn.AdaptiveAvgPool1d(1))
 
         self.features = nn.Sequential(*layers)
         
+        # Real/fake prediction head
         self.head = nn.Sequential(
-            maybe_sn(nn.Linear(512, 256)),
+            maybe_sn(nn.Linear(512 + 64, 256)),  # +64 for class embedding
             nn.LeakyReLU(0.2, inplace=True),
             maybe_sn(nn.Linear(256, 1))
         )
         
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Class prediction head (AC-GAN auxiliary classifier)
+        self.aux_classifier = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(256, num_classes)
+        )
+        
+    def forward(self, x: torch.Tensor, labels: torch.Tensor = None) -> torch.Tensor:
+        """
+        Args:
+            x: Input signal (batch, 2, 1024)
+            labels: Class labels (batch,) - optional, for conditional discrimination
+        Returns:
+            Real/fake prediction score (batch, 1)
+        """
         x = self.multi_scale(x)
         features = self.features(x)
         features = features.view(features.size(0), -1)
-        return self.head(features)
+        
+        # Add class condition
+        if labels is not None:
+            class_emb = self.class_embedding(labels)
+            features_with_class = torch.cat([features, class_emb], dim=1)
+        else:
+            # Use zero padding when unconditional
+            class_emb = torch.zeros(features.size(0), 64, device=features.device)
+            features_with_class = torch.cat([features, class_emb], dim=1)
+        
+        return self.head(features_with_class)
+    
+    def forward_with_aux(self, x: torch.Tensor, labels: torch.Tensor = None):
+        """Return real/fake prediction and class prediction"""
+        x = self.multi_scale(x)
+        features = self.features(x)
+        features = features.view(features.size(0), -1)
+        
+        # Real/fake prediction
+        if labels is not None:
+            class_emb = self.class_embedding(labels)
+            features_with_class = torch.cat([features, class_emb], dim=1)
+        else:
+            class_emb = torch.zeros(features.size(0), 64, device=features.device)
+            features_with_class = torch.cat([features, class_emb], dim=1)
+        
+        validity = self.head(features_with_class)
+        class_pred = self.aux_classifier(features)
+        
+        return validity, class_pred
 
 
 class Classifier(nn.Module):
@@ -270,35 +320,38 @@ class Classifier(nn.Module):
 
     def __init__(self, signal_length: int = 1024, num_classes: int = 24, channels: int = 2,
                  use_eca: bool = True, use_multi_scale: bool = True, use_residual: bool = False,
-                 dropout_rate: float = 0.3):
+                 dropout_rate: float = 0.5, hidden_scale: float = 0.5):  # Added hidden_scale parameter
         super().__init__()
         self.signal_length = signal_length
         self.num_classes = num_classes
         self.channels = channels
         self.use_residual = use_residual
         self.dropout_rate = dropout_rate
+        
+        # Adjust hidden layer sizes based on hidden_scale
+        h1, h2, h3, h4 = int(64 * hidden_scale), int(128 * hidden_scale), int(256 * hidden_scale), int(512 * hidden_scale)
 
-        self.multi_scale = MultiScaleFeatureExtractor(channels, 64, use_multi_scale)
+        self.multi_scale = MultiScaleFeatureExtractor(channels, h1, use_multi_scale)
 
         self.conv2 = nn.Sequential(
-            nn.Conv1d(64, 128, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm1d(128),
+            nn.Conv1d(h1, h2, kernel_size=5, stride=2, padding=2),
+            nn.BatchNorm1d(h2),
             nn.LeakyReLU(0.2, inplace=True),
-            ECANet(128) if use_eca else nn.Identity(),
+            ECANet(h2) if use_eca else nn.Identity(),
             nn.Dropout(dropout_rate)
         )
 
         self.conv3 = nn.Sequential(
-            nn.Conv1d(128, 256, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm1d(256),
+            nn.Conv1d(h2, h3, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm1d(h3),
             nn.LeakyReLU(0.2, inplace=True),
-            ECANet(256) if use_eca else nn.Identity(),
+            ECANet(h3) if use_eca else nn.Identity(),
             nn.Dropout(dropout_rate)
         )
 
         self.conv4 = nn.Sequential(
-            nn.Conv1d(256, 512, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm1d(512),
+            nn.Conv1d(h3, h4, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm1d(h4),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Dropout(dropout_rate),
             nn.AdaptiveAvgPool1d(1)
@@ -306,7 +359,7 @@ class Classifier(nn.Module):
 
         self.classifier = nn.Sequential(
             nn.Dropout(dropout_rate),
-            nn.Linear(512, num_classes)
+            nn.Linear(h4, num_classes)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -328,14 +381,14 @@ class WGANECANet(nn.Module):
                  num_classes: int = 24, channels: int = 2,
                  use_eca: bool = True, use_spectral_norm: bool = True,
                  use_multi_scale: bool = True, use_residual: bool = False,
-                 dropout_rate: float = 0.3):
+                 dropout_rate: float = 0.3, hidden_scale: float = 1.0):
         super().__init__()
 
         self.generator = Generator(noise_dim, signal_length, num_classes, channels)
         self.discriminator = Discriminator(signal_length, num_classes, channels,
                                           use_eca, use_spectral_norm, use_multi_scale)
         self.classifier = Classifier(signal_length, num_classes, channels,
-                                    use_eca, use_multi_scale, use_residual, dropout_rate)
+                                    use_eca, use_multi_scale, use_residual, dropout_rate, hidden_scale)
         self.gradient_penalty = DynamicGradientPenalty()
         
     def forward(self, x: torch.Tensor, mode: str = 'classify') -> Dict[str, torch.Tensor]:
